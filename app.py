@@ -27,23 +27,58 @@ TARGET_DOI = lead_time + review_period + buffer_days
 uploaded_file = st.file_uploader("Upload Excel Accurate", type=["xlsx"])
 
 # =========================
-# 📅 AUTO DETECT DATE
+# 📅 MONTH NORMALIZER
+# =========================
+MONTH_MAP = {
+    "Jan": "Jan", "Feb": "Feb", "Mar": "Mar", "Apr": "Apr",
+    "Mei": "May", "Jun": "Jun", "Jul": "Jul", "Agu": "Aug",
+    "Sep": "Sep", "Okt": "Oct", "Nov": "Nov", "Des": "Dec",
+    "April": "Apr"
+}
+
+def normalize_date(text):
+    for indo, eng in MONTH_MAP.items():
+        text = text.replace(indo, eng)
+    return text
+
+# =========================
+# 📅 AUTO DETECT DATE (FIXED)
 # =========================
 def extract_date_range(file):
-    df_raw = pd.read_excel(file, header=None)
-    text_blob = " ".join(df_raw.astype(str).values.flatten())
+    try:
+        df_raw = pd.read_excel(file, header=None, nrows=10)
 
-    match = re.search(
-        r"Dari\s+(\d{2}\s\w+\s\d{4})\s+s/d\s+(\d{2}\s\w+\s\d{4})",
-        text_blob
-    )
+        text_lines = []
 
-    if match:
-        start_str, end_str = match.groups()
-        start_date = datetime.strptime(start_str, "%d %b %Y")
-        end_date = datetime.strptime(end_str, "%d %b %Y")
-        days = (end_date - start_date).days + 1
-        return days
+        for row in df_raw.values:
+            row_text = " ".join([str(cell) for cell in row if pd.notna(cell)])
+            text_lines.append(row_text)
+
+        text_blob = " ".join(text_lines)
+
+        # DEBUG (aktifkan kalau perlu)
+        # st.write(text_blob)
+
+        match = re.search(
+            r"Dari\s+(\d{2}\s\w+\s\d{4})\s+s/d\s+(\d{2}\s\w+\s\d{4})",
+            text_blob
+        )
+
+        if match:
+            start_str, end_str = match.groups()
+
+            start_str = normalize_date(start_str)
+            end_str = normalize_date(end_str)
+
+            start_date = datetime.strptime(start_str, "%d %b %Y")
+            end_date = datetime.strptime(end_str, "%d %b %Y")
+
+            days = (end_date - start_date).days + 1
+            return days
+
+    except Exception as e:
+        st.warning(f"⚠️ Gagal baca periode otomatis: {e}")
+
     return None
 
 # =========================
@@ -59,17 +94,13 @@ def load_excel(file):
 # =========================
 def calculate(df, days):
 
-    # ===== DEMAND =====
     df["ads"] = df["keluar"] / days
     df["ads"] = df["ads"].clip(lower=0.01)
 
-    # ===== STOCK =====
     df["stock"] = df["stock akhir"]
 
-    # ===== DOI =====
     df["doi"] = df["stock"] / df["ads"]
 
-    # ===== CLASSIFICATION =====
     def classify(row):
         if row["ads"] > 5:
             return "FAST"
@@ -82,10 +113,8 @@ def calculate(df, days):
 
     df["class"] = df.apply(classify, axis=1)
 
-    # ===== STOCKOUT FLAG =====
     df["stockout"] = df["stock"] == 0
 
-    # ===== STATUS =====
     def get_status(row):
         if row["doi"] < lead_time:
             return "CRITICAL"
@@ -98,7 +127,6 @@ def calculate(df, days):
 
     df["status"] = df.apply(get_status, axis=1)
 
-    # ===== ORDER QTY =====
     def calc_order(row):
         if row["status"] in ["CRITICAL", "REORDER"]:
             raw = (TARGET_DOI - row["doi"]) * row["ads"]
@@ -108,7 +136,6 @@ def calculate(df, days):
 
     df["reorder_qty"] = df.apply(calc_order, axis=1)
 
-    # ===== PRIORITY =====
     df["priority"] = (1 / df["doi"]) * 0.6 + df["ads"] * 0.4
     df = df.sort_values(by="priority", ascending=False)
 
@@ -144,7 +171,7 @@ if uploaded_file:
         st.warning("⚠️ Periode tidak terbaca, input manual")
         days = st.number_input("Masukkan jumlah hari", value=7)
 
-    st.success(f"📅 Periode terbaca: {days} hari")
+    st.success(f"📅 Periode digunakan: {days} hari")
 
     df = load_excel(uploaded_file)
 
@@ -156,7 +183,6 @@ if uploaded_file:
     else:
         result = calculate(df, days)
 
-        # METRICS
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("🚨 Critical", (result["status"] == "CRITICAL").sum())
         col2.metric("📦 Reorder", (result["status"] == "REORDER").sum())
