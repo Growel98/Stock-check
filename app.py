@@ -27,7 +27,7 @@ TARGET_DOI = lead_time + review_period + buffer_days
 uploaded_file = st.file_uploader("Upload Excel Accurate", type=["xlsx"])
 
 # =========================
-# 📅 MONTH NORMALIZER
+# 📅 DATE NORMALIZER
 # =========================
 MONTH_MAP = {
     "Jan": "Jan", "Feb": "Feb", "Mar": "Mar", "Apr": "Apr",
@@ -41,23 +41,16 @@ def normalize_date(text):
         text = text.replace(indo, eng)
     return text
 
-# =========================
-# 📅 AUTO DETECT DATE (FIXED)
-# =========================
 def extract_date_range(file):
     try:
         df_raw = pd.read_excel(file, header=None, nrows=10)
 
         text_lines = []
-
         for row in df_raw.values:
             row_text = " ".join([str(cell) for cell in row if pd.notna(cell)])
             text_lines.append(row_text)
 
         text_blob = " ".join(text_lines)
-
-        # DEBUG (aktifkan kalau perlu)
-        # st.write(text_blob)
 
         match = re.search(
             r"Dari\s+(\d{2}\s\w+\s\d{4})\s+s/d\s+(\d{2}\s\w+\s\d{4})",
@@ -77,16 +70,50 @@ def extract_date_range(file):
             return days
 
     except Exception as e:
-        st.warning(f"⚠️ Gagal baca periode otomatis: {e}")
+        st.warning(f"Gagal baca periode: {e}")
 
     return None
 
 # =========================
-# 📊 LOAD DATA
+# 📊 LOAD + AUTO DETECT HEADER
 # =========================
 def load_excel(file):
-    df = pd.read_excel(file)
+    df_raw = pd.read_excel(file, header=None)
+
+    # Cari baris header (yang ada kata "nama" & "akhir")
+    header_row = None
+    for i, row in df_raw.iterrows():
+        row_str = " ".join([str(x).lower() for x in row])
+        if "nama" in row_str and ("akhir" in row_str or "saldo" in row_str):
+            header_row = i
+            break
+
+    if header_row is None:
+        st.error("❌ Tidak menemukan header tabel")
+        return None
+
+    df = pd.read_excel(file, header=header_row)
     df.columns = [col.lower().strip() for col in df.columns]
+
+    # =========================
+    # AUTO MAPPING KOLOM
+    # =========================
+    col_map = {}
+
+    for col in df.columns:
+        if "nama" in col:
+            col_map[col] = "nama barang"
+        elif "awal" in col:
+            col_map[col] = "stock awal"
+        elif "masuk" in col:
+            col_map[col] = "masuk"
+        elif "keluar" in col or "out" in col:
+            col_map[col] = "keluar"
+        elif "akhir" in col or "saldo" in col:
+            col_map[col] = "stock akhir"
+
+    df = df.rename(columns=col_map)
+
     return df
 
 # =========================
@@ -98,7 +125,6 @@ def calculate(df, days):
     df["ads"] = df["ads"].clip(lower=0.01)
 
     df["stock"] = df["stock akhir"]
-
     df["doi"] = df["stock"] / df["ads"]
 
     def classify(row):
@@ -112,8 +138,6 @@ def calculate(df, days):
             return "DEAD"
 
     df["class"] = df.apply(classify, axis=1)
-
-    df["stockout"] = df["stock"] == 0
 
     def get_status(row):
         if row["doi"] < lead_time:
@@ -130,8 +154,7 @@ def calculate(df, days):
     def calc_order(row):
         if row["status"] in ["CRITICAL", "REORDER"]:
             raw = (TARGET_DOI - row["doi"]) * row["ads"]
-            order = max(MOQ, round(raw))
-            return order
+            return max(MOQ, round(raw))
         return 0
 
     df["reorder_qty"] = df.apply(calc_order, axis=1)
@@ -175,27 +198,30 @@ if uploaded_file:
 
     df = load_excel(uploaded_file)
 
-    required = ["nama barang", "stock awal", "masuk", "keluar", "stock akhir"]
-    missing = [col for col in required if col not in df.columns]
+    if df is not None:
+        st.write("🔍 Kolom terbaca:", df.columns.tolist())
 
-    if missing:
-        st.error(f"❌ Kolom tidak lengkap: {missing}")
-    else:
-        result = calculate(df, days)
+        required = ["nama barang", "stock awal", "masuk", "keluar", "stock akhir"]
+        missing = [col for col in required if col not in df.columns]
 
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("🚨 Critical", (result["status"] == "CRITICAL").sum())
-        col2.metric("📦 Reorder", (result["status"] == "REORDER").sum())
-        col3.metric("📉 Overstock", (result["status"] == "OVERSTOCK").sum())
-        col4.metric("💀 Dead Stock", (result["class"] == "DEAD").sum())
+        if missing:
+            st.error(f"❌ Kolom belum lengkap: {missing}")
+        else:
+            result = calculate(df, days)
 
-        st.subheader("🔥 Priority Order List")
-        st.dataframe(result.head(50))
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("🚨 Critical", (result["status"] == "CRITICAL").sum())
+            col2.metric("📦 Reorder", (result["status"] == "REORDER").sum())
+            col3.metric("📉 Overstock", (result["status"] == "OVERSTOCK").sum())
+            col4.metric("💀 Dead Stock", (result["class"] == "DEAD").sum())
 
-        st.subheader("📊 Full Data")
-        st.dataframe(result)
+            st.subheader("🔥 Priority Order List")
+            st.dataframe(result.head(50))
 
-        pdf_file = generate_pdf(result)
+            st.subheader("📊 Full Data")
+            st.dataframe(result)
 
-        with open(pdf_file, "rb") as f:
-            st.download_button("📄 Download Report", f)
+            pdf_file = generate_pdf(result)
+
+            with open(pdf_file, "rb") as f:
+                st.download_button("📄 Download Report", f)
