@@ -1,117 +1,175 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
+import numpy as np
+import re
+from datetime import datetime
+from fpdf import FPDF
 
-st.set_page_config(page_title="Inventory Decision Engine", layout="wide")
+st.set_page_config(page_title="Smart Inventory AI", layout="wide")
 
-st.title("📦 Inventory Decision Engine")
-st.write("Upload laporan PDF dari Accurate untuk analisa restock")
+st.title("🧠 Smart Inventory Decision Engine")
 
-uploaded_file = st.file_uploader("Upload PDF Accurate", type="pdf")
+# =========================
+# ⚙️ SETTINGS
+# =========================
+st.sidebar.header("⚙️ Parameter")
 
-# PARAMETER BISNIS
-DAYS = 94
-SAFETY = 14
+lead_time = st.sidebar.number_input("Lead Time (hari)", value=14)
+review_period = st.sidebar.number_input("Review Period (hari)", value=7)
+buffer_days = st.sidebar.number_input("Buffer (hari)", value=3)
+MOQ = st.sidebar.number_input("MOQ (minimum order)", value=5)
 
-def lead_time(nama):
-    return 5 if "TH" in str(nama) else 14
+TARGET_DOI = lead_time + review_period + buffer_days
 
-if uploaded_file:
-    st.success("File berhasil diupload ✅")
+# =========================
+# 📂 FILE UPLOAD
+# =========================
+uploaded_file = st.file_uploader("Upload Excel Accurate", type=["xlsx"])
 
-    if st.button("🔍 Analyze Sekarang"):
-        st.write("🚀 Memulai analisa...")
+# =========================
+# 📅 AUTO DETECT DATE
+# =========================
+def extract_date_range(file):
+    df_raw = pd.read_excel(file, header=None)
+    text_blob = " ".join(df_raw.astype(str).values.flatten())
 
-        data = []
+    match = re.search(
+        r"Dari\s+(\d{2}\s\w+\s\d{4})\s+s/d\s+(\d{2}\s\w+\s\d{4})",
+        text_blob
+    )
 
-        try:
-            with pdfplumber.open(uploaded_file) as pdf:
-                st.write(f"📄 Total halaman: {len(pdf.pages)}")
+    if match:
+        start_str, end_str = match.groups()
+        start_date = datetime.strptime(start_str, "%d %b %Y")
+        end_date = datetime.strptime(end_str, "%d %b %Y")
+        days = (end_date - start_date).days + 1
+        return days
+    return None
 
-                for i, page in enumerate(pdf.pages):
-                    table = page.extract_table()
+# =========================
+# 📊 LOAD DATA
+# =========================
+def load_excel(file):
+    df = pd.read_excel(file)
+    df.columns = [col.lower().strip() for col in df.columns]
+    return df
 
-                    if table:
-                        st.write(f"✅ Halaman {i+1}: table ditemukan")
+# =========================
+# 🧠 CORE ENGINE
+# =========================
+def calculate(df, days):
 
-                        for row in table[1:]:
-                            try:
-                                nama = row[0]
-                                kode = row[1]
+    # ===== DEMAND =====
+    df["ads"] = df["keluar"] / days
+    df["ads"] = df["ads"].clip(lower=0.01)
 
-                                keluar = float(
-                                    str(row[6]).replace(",", "").replace(".", "")
-                                )
+    # ===== STOCK =====
+    df["stock"] = df["stock akhir"]
 
-                                stok = float(
-                                    str(row[8]).replace(",", "").replace(".", "")
-                                )
+    # ===== DOI =====
+    df["doi"] = df["stock"] / df["ads"]
 
-                                data.append([nama, kode, keluar, stok])
-
-                            except:
-                                continue
-                    else:
-                        st.write(f"❌ Halaman {i+1}: tidak ada table")
-
-        except Exception as e:
-            st.error(f"Gagal membaca PDF: {e}")
-
-        st.write(f"📊 Total data terbaca: {len(data)}")
-
-        # =========================
-        # JIKA DATA KOSONG
-        # =========================
-        if len(data) == 0:
-            st.error("❌ Tidak ada data yang berhasil dibaca dari PDF")
-            st.warning("Kemungkinan format PDF tidak terbaca sebagai table")
-
+    # ===== CLASSIFICATION =====
+    def classify(row):
+        if row["ads"] > 5:
+            return "FAST"
+        elif row["ads"] > 1:
+            return "MEDIUM"
+        elif row["ads"] > 0.1:
+            return "SLOW"
         else:
-            df = pd.DataFrame(data, columns=["Nama", "Kode", "Keluar", "Stok"])
+            return "DEAD"
 
-            # FILTER
-            df = df[df["Keluar"] > 2]
-            df = df[df["Stok"] > 0]
+    df["class"] = df.apply(classify, axis=1)
 
-            if len(df) == 0:
-                st.warning("⚠️ Data ada, tapi setelah filter tidak tersisa")
+    # ===== STOCKOUT FLAG =====
+    df["stockout"] = df["stock"] == 0
 
-            else:
-                # =========================
-                # HITUNG METRIK
-                # =========================
-                df["AvgDaily"] = df["Keluar"] / DAYS
-                df["LeadTime"] = df["Nama"].apply(lead_time)
-                df["DOI"] = df["Stok"] / df["AvgDaily"]
-                df["Target"] = (df["LeadTime"] + SAFETY) * df["AvgDaily"]
-                df["QtyBeli"] = df["Target"] - df["Stok"]
+    # ===== STATUS =====
+    def get_status(row):
+        if row["doi"] < lead_time:
+            return "CRITICAL"
+        elif row["doi"] < TARGET_DOI:
+            return "REORDER"
+        elif row["doi"] > 60:
+            return "OVERSTOCK"
+        else:
+            return "OK"
 
-                def kategori(row):
-                    if row["DOI"] < row["LeadTime"]:
-                        return "🔴 BELI SEKARANG"
-                    elif row["DOI"] < (row["LeadTime"] + SAFETY):
-                        return "🟠 BELI"
-                    else:
-                        return "🟡 AMAN"
+    df["status"] = df.apply(get_status, axis=1)
 
-                df["Status"] = df.apply(kategori, axis=1)
-                df["QtyBeli"] = df["QtyBeli"].apply(lambda x: max(0, round(x)))
+    # ===== ORDER QTY =====
+    def calc_order(row):
+        if row["status"] in ["CRITICAL", "REORDER"]:
+            raw = (TARGET_DOI - row["doi"]) * row["ads"]
+            order = max(MOQ, round(raw))
+            return order
+        return 0
 
-                # =========================
-                # OUTPUT
-                # =========================
-                st.success("🔥 Analisa selesai")
+    df["reorder_qty"] = df.apply(calc_order, axis=1)
 
-                # PRIORITAS
-                st.subheader("🔴 Prioritas Restock")
-                prioritas = df[df["Status"] != "🟡 AMAN"].sort_values(
-                    by="QtyBeli", ascending=False
-                )
-                st.dataframe(prioritas, use_container_width=True)
+    # ===== PRIORITY =====
+    df["priority"] = (1 / df["doi"]) * 0.6 + df["ads"] * 0.4
+    df = df.sort_values(by="priority", ascending=False)
 
-                # SEMUA DATA
-                st.subheader("📦 Semua SKU")
-                st.dataframe(
-                    df.sort_values(by="QtyBeli", ascending=False),
-                    use_container_width=True
-                )
+    return df
+
+# =========================
+# 📄 PDF OUTPUT
+# =========================
+def generate_pdf(df):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=9)
+
+    pdf.cell(200, 10, txt="Smart Reorder Report", ln=True)
+
+    for _, row in df.iterrows():
+        if row["status"] in ["CRITICAL", "REORDER"]:
+            line = f"{row['nama barang']} | {row['class']} | DOI:{round(row['doi'],1)} | Order:{row['reorder_qty']}"
+            pdf.cell(200, 7, txt=line, ln=True)
+
+    file_path = "reorder_report.pdf"
+    pdf.output(file_path)
+    return file_path
+
+# =========================
+# 🚀 RUN
+# =========================
+if uploaded_file:
+
+    days = extract_date_range(uploaded_file)
+
+    if not days:
+        st.warning("⚠️ Periode tidak terbaca, input manual")
+        days = st.number_input("Masukkan jumlah hari", value=7)
+
+    st.success(f"📅 Periode terbaca: {days} hari")
+
+    df = load_excel(uploaded_file)
+
+    required = ["nama barang", "stock awal", "masuk", "keluar", "stock akhir"]
+    missing = [col for col in required if col not in df.columns]
+
+    if missing:
+        st.error(f"❌ Kolom tidak lengkap: {missing}")
+    else:
+        result = calculate(df, days)
+
+        # METRICS
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("🚨 Critical", (result["status"] == "CRITICAL").sum())
+        col2.metric("📦 Reorder", (result["status"] == "REORDER").sum())
+        col3.metric("📉 Overstock", (result["status"] == "OVERSTOCK").sum())
+        col4.metric("💀 Dead Stock", (result["class"] == "DEAD").sum())
+
+        st.subheader("🔥 Priority Order List")
+        st.dataframe(result.head(50))
+
+        st.subheader("📊 Full Data")
+        st.dataframe(result)
+
+        pdf_file = generate_pdf(result)
+
+        with open(pdf_file, "rb") as f:
+            st.download_button("📄 Download Report", f)
